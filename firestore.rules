@@ -1,0 +1,92 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Password salvata nella console (config/admin) o impostata dall'organizzatore (config/referee).
+    // Nessun client puo' leggere la collezione "config".
+    function cfgPwd(name) {
+      return get(/databases/$(database)/documents/config/$(name)).data.password;
+    }
+
+    // Un utente e' organizzatore/arbitro solo se il codice che ha salvato
+    // coincide con la password ATTUALE: cambiando la password, tutti i vecchi accessi decadono.
+    function isAdmin() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.code == cfgPwd('admin');
+    }
+    function isReferee() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/refs/$(request.auth.uid))
+        && get(/databases/$(database)/documents/refs/$(request.auth.uid)).data.code == cfgPwd('referee');
+    }
+
+    // Password: leggibile da nessuno. Solo l'organizzatore puo' cambiare quella degli arbitri.
+    match /config/{docId} {
+      allow read: if false;
+      allow write: if docId == 'referee' && isAdmin();
+    }
+
+    // "Accesso": chi scrive il codice giusto diventa organizzatore / arbitro.
+    match /admins/{uid} {
+      allow read: if false;
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['code'])
+        && request.resource.data.code is string
+        && request.resource.data.code == cfgPwd('admin');
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+    match /refs/{uid} {
+      allow read: if false;
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['code'])
+        && request.resource.data.code is string
+        && request.resource.data.code == cfgPwd('referee');
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Dati del torneo: tutti leggono, solo l'organizzatore gestisce squadre e partite.
+    match /teams/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    // Avvisi (cambi data, comunicazioni): tutti leggono, solo l'organizzatore scrive.
+    match /notices/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    // Chat: tutti leggono, chiunque abbia l'accesso anonimo puo' scrivere (con un nome),
+    // l'organizzatore puo' cancellare qualsiasi messaggio e disattivare la chat (meta/info.chat = false).
+    function chatOn() {
+      return !exists(/databases/$(database)/documents/meta/info)
+        || get(/databases/$(database)/documents/meta/info).data.get('chat', true) != false;
+    }
+    match /chat/{id} {
+      allow read: if true;
+      allow create: if request.auth != null && chatOn()
+        && request.resource.data.keys().hasOnly(['t', 'n', 'u', 'ts', 'r'])
+        && request.resource.data.t is string && request.resource.data.t.size() > 0 && request.resource.data.t.size() <= 300
+        && request.resource.data.n is string && request.resource.data.n.size() > 0 && request.resource.data.n.size() <= 20
+        && request.resource.data.u == request.auth.uid
+        && request.resource.data.ts is number
+        && request.resource.data.ts > request.time.toMillis() - 600000
+        && request.resource.data.ts < request.time.toMillis() + 600000
+        && (request.resource.data.r == ''
+            || (request.resource.data.r == 'admin' && isAdmin())
+            || (request.resource.data.r == 'ref' && (isReferee() || isAdmin())));
+      allow update: if false;
+      allow delete: if isAdmin() || (request.auth != null && resource.data.u == request.auth.uid);
+    }
+    match /meta/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /matches/{id} {
+      allow read: if true;
+      allow create, delete: if isAdmin();
+      // L'arbitro puo' solo aggiornare eventi, formazioni, stato, note e vincitore ai rigori.
+      allow update: if isAdmin()
+        || (isReferee() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['events', 'lu', 'status', 'notes', 'pen']));
+    }
+  }
+}
